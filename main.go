@@ -44,12 +44,17 @@ func main() {
 
 	addr := net.JoinHostPort(*bind, port)
 
-	displayAddr := *bind
-	if displayAddr == "" {
-		displayAddr = "0.0.0.0"
+	listenAddr := *bind
+	if listenAddr == "" {
+		listenAddr = "0.0.0.0"
 	}
 
-	fmt.Printf("Serving HTTP on %s port %s (http://%s:%s/) ...\n", displayAddr, port, displayAddr, port)
+	displayAddr := listenAddr
+	if listenAddr == "0.0.0.0" || listenAddr == "::" {
+		displayAddr = "localhost"
+	}
+
+	fmt.Printf("Serving HTTP on %s port %s (http://%s:%s/) ...\n", listenAddr, port, displayAddr, port)
 
 	err = http.ListenAndServe(addr, handler)
 	if err != nil {
