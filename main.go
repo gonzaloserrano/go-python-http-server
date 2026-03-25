@@ -12,9 +12,12 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
 
 func main() {
+	log.SetFlags(0)
+
 	bind := flag.String("bind", "", "Specify alternate bind address [default: all interfaces]")
 	flag.StringVar(bind, "b", "", "Specify alternate bind address [default: all interfaces]")
 	directory := flag.String("directory", ".", "Specify alternative directory [default: current directory]")
@@ -40,7 +43,13 @@ func main() {
 		log.Fatalf("Error resolving directory: %v", err)
 	}
 
-	handler := &fileServerHandler{rootDir: absDir}
+	root, err := os.OpenRoot(absDir)
+	if err != nil {
+		log.Fatalf("Error opening directory: %v", err)
+	}
+	defer root.Close()
+
+	handler := &fileServerHandler{rootDir: absDir, root: root}
 
 	addr := net.JoinHostPort(*bind, port)
 
@@ -54,9 +63,16 @@ func main() {
 		displayAddr = "localhost"
 	}
 
-	fmt.Printf("Serving HTTP on %s port %s (http://%s:%s/) ...\n", listenAddr, port, displayAddr, port)
+	fmt.Printf("Serving HTTP on %s port %s (http://%s/) ...\n", listenAddr, port, net.JoinHostPort(displayAddr, port))
 
-	err = http.ListenAndServe(addr, handler)
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		WriteTimeout:      5 * time.Minute,
+		IdleTimeout:       120 * time.Second,
+	}
+	err = srv.ListenAndServe()
 	if err != nil {
 		log.Fatalf("Error starting server: %v", err)
 	}
@@ -64,6 +80,7 @@ func main() {
 
 type fileServerHandler struct {
 	rootDir string
+	root    *os.Root
 }
 
 func (h *fileServerHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -73,24 +90,17 @@ func (h *fileServerHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		clientAddr = host
 	}
 
-	// Clean the URL path
+	// Clean the URL path and convert to relative path for os.Root
 	urlPath := path.Clean(r.URL.Path)
 	if !strings.HasPrefix(urlPath, "/") {
 		urlPath = "/" + urlPath
 	}
-
-	// Build the file path
-	filePath := filepath.Join(h.rootDir, filepath.FromSlash(urlPath))
-
-	// Security check: ensure the path is within the root directory
-	if !strings.HasPrefix(filePath, h.rootDir) {
-		http.Error(w, "403 Forbidden", http.StatusForbidden)
-		logRequest(clientAddr, r, http.StatusForbidden)
-		return
+	relPath := strings.TrimPrefix(urlPath, "/")
+	if relPath == "" {
+		relPath = "."
 	}
 
-	// Get file info
-	info, err := os.Stat(filePath)
+	info, err := h.root.Stat(relPath)
 	if os.IsNotExist(err) {
 		http.Error(w, "404 File not found", http.StatusNotFound)
 		logRequest(clientAddr, r, http.StatusNotFound)
@@ -102,33 +112,28 @@ func (h *fileServerHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Handle directory
 	if info.IsDir() {
-		// Check for index.html
-		indexPath := filepath.Join(filePath, "index.html")
-		if indexInfo, err := os.Stat(indexPath); err == nil && !indexInfo.IsDir() {
-			serveFile(w, r, indexPath, clientAddr)
+		indexRelPath := path.Join(relPath, "index.html")
+		if indexInfo, err := h.root.Stat(indexRelPath); err == nil && !indexInfo.IsDir() {
+			serveFile(w, r, h.root, indexRelPath, clientAddr)
 			return
 		}
 
-		// Redirect if URL doesn't end with /
 		if !strings.HasSuffix(r.URL.Path, "/") {
 			http.Redirect(w, r, r.URL.Path+"/", http.StatusMovedPermanently)
 			logRequest(clientAddr, r, http.StatusMovedPermanently)
 			return
 		}
 
-		// Serve directory listing
-		serveDirListing(w, r, filePath, urlPath, clientAddr)
+		serveDirListing(w, r, h.root, relPath, urlPath, clientAddr)
 		return
 	}
 
-	// Serve the file
-	serveFile(w, r, filePath, clientAddr)
+	serveFile(w, r, h.root, relPath, clientAddr)
 }
 
-func serveFile(w http.ResponseWriter, r *http.Request, filePath string, clientAddr string) {
-	file, err := os.Open(filePath)
+func serveFile(w http.ResponseWriter, r *http.Request, root *os.Root, relPath string, clientAddr string) {
+	file, err := root.Open(relPath)
 	if err != nil {
 		http.Error(w, "500 Internal Server Error", http.StatusInternalServerError)
 		logRequest(clientAddr, r, http.StatusInternalServerError)
@@ -143,12 +148,20 @@ func serveFile(w http.ResponseWriter, r *http.Request, filePath string, clientAd
 		return
 	}
 
-	http.ServeContent(w, r, filepath.Base(filePath), info.ModTime(), file)
+	http.ServeContent(w, r, path.Base(relPath), info.ModTime(), file)
 	logRequest(clientAddr, r, http.StatusOK)
 }
 
-func serveDirListing(w http.ResponseWriter, r *http.Request, dirPath string, urlPath string, clientAddr string) {
-	entries, err := os.ReadDir(dirPath)
+func serveDirListing(w http.ResponseWriter, r *http.Request, root *os.Root, relPath string, urlPath string, clientAddr string) {
+	dir, err := root.Open(relPath)
+	if err != nil {
+		http.Error(w, "500 Internal Server Error", http.StatusInternalServerError)
+		logRequest(clientAddr, r, http.StatusInternalServerError)
+		return
+	}
+	defer dir.Close()
+
+	entries, err := dir.ReadDir(-1)
 	if err != nil {
 		http.Error(w, "500 Internal Server Error", http.StatusInternalServerError)
 		logRequest(clientAddr, r, http.StatusInternalServerError)
@@ -215,9 +228,4 @@ func logRequest(clientAddr string, r *http.Request, statusCode int) {
 		r.Proto,
 		statusCode,
 	)
-}
-
-func init() {
-	// Configure log to not print date/time prefix since we want Python-like format
-	log.SetFlags(0)
 }
